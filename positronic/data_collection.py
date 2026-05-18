@@ -455,7 +455,14 @@ def so101cfg(robot_arm, **kwargs):
     webxr=positronic.cfg.webxr.oculus,
     sound=positronic.cfg.sound.sound,
     operator_position=OperatorPosition.BACK,
-    cameras={},
+    cameras={
+        'image.usb': positronic.cfg.hardware.camera.opencv.override(
+            camera_id=0, width=640, height=480, fps=30, buffer_size=1, auto_wb=0, wb_temperature=6000
+        ),
+        'image.zed': positronic.cfg.hardware.camera.zed.override(
+            view='left', resolution='hd720', fps=30, output_width=640, output_height=480
+        ),
+    },
 )
 def pipercfg(robot_arm, **kwargs):
     main(robot_arm=robot_arm, gripper=robot_arm, **kwargs)

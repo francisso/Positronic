@@ -2,6 +2,7 @@ import logging
 from collections.abc import Iterator
 from typing import Literal
 
+import cv2
 import numpy as np
 import pyzed.sl as sl
 
@@ -23,6 +24,8 @@ class SLCamera(pimm.ControlSystem):
         depth_mask: bool = False,
         max_recovery_time_sec: float = 10,
         image_enhancement: bool = False,
+        output_width: int | None = None,
+        output_height: int | None = None,
     ):
         """
         StereoLabs camera driver.
@@ -48,6 +51,9 @@ class SLCamera(pimm.ControlSystem):
         self._resolution_name = resolution
         self._depth_mode_name = depth_mode
         self._image_enhancement = image_enhancement
+        self._output_resolution = (
+            None if output_width is None or output_height is None else (output_width, output_height)
+        )
         self._depth_mask_requested = depth_mask
 
         self.max_depth = max_depth
@@ -130,6 +136,8 @@ class SLCamera(pimm.ControlSystem):
             if zed.retrieve_image(image, view) == SUCCESS:
                 # The images are in BGRA format, convert to RGB
                 np_image = image.get_data()[:, :, [2, 1, 0]]
+                if self._output_resolution is not None:
+                    np_image = cv2.resize(np_image, self._output_resolution)
 
                 # Emit main frame (either single view or side-by-side)
                 # Note: For side-by-side, we emit the full (H, W*2, 3) image

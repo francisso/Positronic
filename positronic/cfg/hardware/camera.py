@@ -41,7 +41,17 @@ def luxonis(**kwargs):
 
 
 @cfn.config()
-def opencv(camera_id: int = 0, width: int = 640, height: int = 480, fps: int = 30):
+def opencv(
+    camera_id: int = 0,
+    width: int = 640,
+    height: int = 480,
+    fps: int = 30,
+    buffer_size: int | None = None,
+    auto_wb: float | None = None,
+    wb_temperature: float | None = None,
+):
     from positronic.drivers.camera.opencv import OpenCVCamera
 
-    return OpenCVCamera(camera_id, (width, height), fps)
+    return OpenCVCamera(
+        camera_id, (width, height), fps, buffer_size=buffer_size, auto_wb=auto_wb, wb_temperature=wb_temperature
+    )

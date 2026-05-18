@@ -1,3 +1,4 @@
+import logging
 import time
 from collections.abc import Iterator
 
@@ -14,6 +15,23 @@ _METERS_TO_PIPER_POSITION = 1_000_000.0
 _RADIANS_TO_PIPER_ANGLE = 180_000.0 / np.pi
 _PIPER_POSITION_TO_METERS = 1.0 / _METERS_TO_PIPER_POSITION
 _PIPER_ANGLE_TO_RADIANS = np.pi / 180_000.0
+
+_log = logging.getLogger('piper')
+
+
+def _err_status_to_dict(err_status) -> dict:
+    return {k: v for k, v in vars(err_status).items() if v}
+
+
+def _arm_status_snapshot(arm_status) -> dict:
+    return {
+        'ctrl_mode': str(arm_status.ctrl_mode),
+        'arm_status': str(arm_status.arm_status),
+        'mode_feed': str(arm_status.mode_feed),
+        'motion_status': str(arm_status.motion_status),
+        'err_code': f'0x{int(arm_status.err_code):04X}',
+        'err_flags': _err_status_to_dict(arm_status.err_status),
+    }
 
 
 class PiperState(State, pimm.shared_memory.NumpySMAdapter):
@@ -83,6 +101,7 @@ class Robot(pimm.ControlSystem):
         self.robot_meta = pimm.ControlSystemEmitter(self)
 
     def run(self, should_stop: pimm.SignalReceiver, clock: pimm.Clock) -> Iterator[pimm.Sleep]:
+        _log.info('Connecting to CAN %s (speed=%d%%)', self.can_name, self.speed)
         piper = C_PiperInterface_V2(
             self.can_name,
             self.judge_flag,
@@ -92,8 +111,10 @@ class Robot(pimm.ControlSystem):
             self.start_sdk_gripper_limit,
         )
         piper.ConnectPort()
+        _log.info('Enabling arm...')
         while not should_stop.value and not piper.EnablePiper():
             yield pimm.Sleep(0.01)
+        _log.info('Arm enabled. enable_status=%s', piper.GetArmEnableStatus())
         piper.GripperCtrl(0, self.gripper_effort, 0x01, 0)
         self.robot_meta.emit({'joint_names': _JOINT_NAMES, 'control_frame': 'end_effector'})
 
@@ -101,6 +122,7 @@ class Robot(pimm.ControlSystem):
         state = PiperState()
         last_q = self._read_joints(piper)
         last_ts = clock.now_ns()
+        last_status_snapshot: dict | None = None
 
         try:
             while not should_stop.value:
@@ -108,11 +130,16 @@ class Robot(pimm.ControlSystem):
                 if cmd_msg.updated:
                     match cmd_msg.data:
                         case roboarm_command.Reset():
+                            _log.info('CMD Reset -> home joints=%s', self.home_joints)
                             self._send_joints(piper, np.asarray(self.home_joints, dtype=np.float32))
                         case roboarm_command.Recover():
+                            _log.warning(
+                                'CMD Recover -> EmergencyStop(0x02) (note: 0x02 == ResetPiper = motors lose power)'
+                            )
                             piper.EmergencyStop(0x02)
                             while not should_stop.value and not piper.EnablePiper():
                                 yield pimm.Sleep(0.01)
+                            _log.info('Recover: arm re-enabled. enable_status=%s', piper.GetArmEnableStatus())
                         case roboarm_command.CartesianPosition(pose):
                             self._send_cartesian(piper, pose)
                         case roboarm_command.JointPosition(positions):
@@ -128,7 +155,12 @@ class Robot(pimm.ControlSystem):
                 q = self._read_joints(piper)
                 dq = self._estimate_velocity(q, last_q, now, last_ts)
                 ee_pose = self._read_ee_pose(piper)
-                status = self._read_status(piper)
+                raw_arm_status = piper.GetArmStatus().arm_status
+                status = self._classify_status(raw_arm_status)
+                snapshot = _arm_status_snapshot(raw_arm_status)
+                if snapshot != last_status_snapshot:
+                    _log.info('arm status change: %s -> %s (-> %s)', last_status_snapshot, snapshot, status.name)
+                    last_status_snapshot = snapshot
                 grip = self._read_gripper(piper)
 
                 state.encode(q, dq, ee_pose, status)
@@ -144,11 +176,19 @@ class Robot(pimm.ControlSystem):
     def _send_cartesian(self, piper: C_PiperInterface_V2, pose: geom.Transform3D):
         xyz = np.rint(pose.translation * _METERS_TO_PIPER_POSITION).astype(int)
         rpy = np.rint(pose.rotation.as_euler * _RADIANS_TO_PIPER_ANGLE).astype(int)
+        _log.debug(
+            'CMD CartesianPosition xyz_m=%s rpy_rad=%s -> piper xyz=%s rpy=%s',
+            pose.translation.tolist(),
+            pose.rotation.as_euler.tolist(),
+            xyz.tolist(),
+            rpy.tolist(),
+        )
         piper.MotionCtrl_2(0x01, 0x00, self.speed, 0x00)
         piper.EndPoseCtrl(int(xyz[0]), int(xyz[1]), int(xyz[2]), int(rpy[0]), int(rpy[1]), int(rpy[2]))
 
     def _send_joints(self, piper: C_PiperInterface_V2, q: np.ndarray):
         joints = np.rint(q * _RADIANS_TO_PIPER_ANGLE).astype(int)
+        _log.info('CMD JointPosition rad=%s -> piper=%s', q.tolist(), joints.tolist())
         piper.MotionCtrl_2(0x01, 0x01, self.speed, 0x00)
         piper.JointCtrl(int(joints[0]), int(joints[1]), int(joints[2]), int(joints[3]), int(joints[4]), int(joints[5]))
 
@@ -179,11 +219,11 @@ class Robot(pimm.ControlSystem):
         gripper = piper.GetArmGripperMsgs().gripper_state
         return min(1.0, max(0.0, gripper.grippers_angle * _PIPER_POSITION_TO_METERS / self.gripper_range_m))
 
-    def _read_status(self, piper: C_PiperInterface_V2) -> RobotStatus:
-        arm_status = piper.GetArmStatus().arm_status
-        if arm_status.err_status != 0 or arm_status.arm_status != 0:
+    def _classify_status(self, arm_status) -> RobotStatus:
+        # `arm_status.err_status` is an ErrStatus object — never compare to 0 directly.
+        if any(vars(arm_status.err_status).values()) or int(arm_status.arm_status) != 0:
             return RobotStatus.ERROR
-        if arm_status.motion_status != 0:
+        if int(arm_status.motion_status) != 0:
             return RobotStatus.MOVING
         return RobotStatus.AVAILABLE
 

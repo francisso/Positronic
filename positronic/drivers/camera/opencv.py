@@ -8,10 +8,21 @@ import pimm
 
 
 class OpenCVCamera(pimm.ControlSystem):
-    def __init__(self, camera_id: int, resolution: tuple[int, int], fps: int):
+    def __init__(
+        self,
+        camera_id: int,
+        resolution: tuple[int, int],
+        fps: int,
+        buffer_size: int | None = None,
+        auto_wb: float | None = None,
+        wb_temperature: float | None = None,
+    ):
         self.camera_id = camera_id
         self.resolution = resolution
         self.fps = fps
+        self.buffer_size = buffer_size
+        self.auto_wb = auto_wb
+        self.wb_temperature = wb_temperature
         self.frame = pimm.ControlSystemEmitter(self)
         self._frame_adapter = None
 
@@ -20,6 +31,12 @@ class OpenCVCamera(pimm.ControlSystem):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
         cap.set(cv2.CAP_PROP_FPS, self.fps)
+        if self.buffer_size is not None:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
+        if self.auto_wb is not None:
+            cap.set(cv2.CAP_PROP_AUTO_WB, self.auto_wb)
+        if self.wb_temperature is not None:
+            cap.set(cv2.CAP_PROP_WB_TEMPERATURE, self.wb_temperature)
 
         if not cap.isOpened():
             raise RuntimeError(f'Failed to open camera {self.camera_id}')
