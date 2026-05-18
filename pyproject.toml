@@ -108,7 +108,7 @@ conflicts = [
 ]
 
 [tool.uv.sources.pyzed]
-url = "https://download.stereolabs.com/zedsdk/5.0/whl/linux_x86_64/pyzed-5.0-cp311-cp311-linux_x86_64.whl"
+url = "https://download.stereolabs.com/zedsdk/5.2/whl/linux_x86_64/pyzed-5.2-cp311-cp311-linux_x86_64.whl"
 
 [tool.uv.sources.openpi-client]
 git = "https://github.com/Positronic-Robotics/openpi.git"
