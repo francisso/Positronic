@@ -3,6 +3,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import nullcontext
 from enum import Enum
+from pathlib import Path
 
 import configuronic as cfn
 import numpy as np
@@ -22,6 +23,7 @@ from positronic.drivers import roboarm
 from positronic.drivers.roboarm import State as RoboarmState
 from positronic.drivers.webxr import WebXR
 from positronic.gui.dpg import DearpyguiUi
+from positronic.simulator.mujoco.piper import MujocoPiper, materialize_piper_mujoco_model
 from positronic.simulator.mujoco.sim import MujocoCameras, MujocoFranka, MujocoGripper, MujocoSim
 from positronic.simulator.mujoco.transforms import MujocoSceneTransform
 from positronic.utils import package_assets_path
@@ -350,6 +352,92 @@ main_cfg = cfn.Config(
 )
 
 
+@cfn.config()
+def piper_stack_cubes_loaders():
+    from positronic.simulator.mujoco.transforms import AddBox, AddCameras, SetBodyPosition
+
+    return [
+        AddCameras(
+            additional_cameras={
+                'side_view': {'pos': [0.80, -0.80, 0.55], 'xyaxes': [0.707, 0.707, 0.000, -0.408, 0.408, 0.816]},
+                'front_view': {'pos': [0.75, 0.00, 0.48], 'xyaxes': [0.000, 1.000, 0.000, -0.625, 0.000, 0.781]},
+            }
+        ),
+        AddBox(name='table', size=[0.30, 0.30, 0.02], pos=[0.35, 0.0, 0.10], rgba=[0.65, 0.65, 0.65, 1]),
+        AddBox(name='box_0', size=[0.02, 0.02, 0.01], pos=[0.0, 0.0, 0.01], rgba=[1, 0, 0, 1], freejoint=True),
+        SetBodyPosition(body_name='box_0_body', random_position=[[0.20, -0.16, 0.13], [0.46, 0.16, 0.13]]),
+        AddBox(name='box_1', size=[0.02, 0.02, 0.01], pos=[0.0, 0.0, 0.01], rgba=[0, 1, 0, 1], freejoint=True),
+        SetBodyPosition(body_name='box_1_body', random_position=[[0.20, -0.16, 0.13], [0.46, 0.16, 0.13]]),
+    ]
+
+
+@cfn.config(
+    urdf_path=str(Path(__file__).resolve().parents[1] / 'piper_description/urdf/piper_description.urdf'),
+    mujoco_model_path=None,
+    webxr=positronic.cfg.webxr.oculus,
+    cameras={'image.exterior': 'side_view', 'image.agent_view': 'front_view'},
+    sound=positronic.cfg.sound.sound,
+    operator_position=OperatorPosition.BACK,
+    loaders=piper_stack_cubes_loaders,
+)
+def main_piper_sim(
+    urdf_path: str,
+    mujoco_model_path: str | None,
+    webxr: WebXR,
+    cameras: dict[str, str],
+    sound: pimm.ControlSystem | None = None,
+    loaders: Sequence[MujocoSceneTransform] = (),
+    output_dir: str | None = None,
+    fps: int = 30,
+    operator_position: OperatorPosition = OperatorPosition.FRONT,
+    task: str | None = None,
+):
+    if mujoco_model_path is None:
+        mujoco_model_path = str(Path(urdf_path).expanduser().parents[1] / 'mujoco_model/piper_description.xml')
+
+    model_path = materialize_piper_mujoco_model(mujoco_model_path, urdf_path)
+    sim = MujocoSim(model_path, loaders)
+    robot_arm = MujocoPiper(sim, urdf_path)
+    mujoco_cameras = MujocoCameras(sim.model, sim.data, resolution=(320, 240), fps=fps)
+    cameras = {name: mujoco_cameras.cameras[orig_name] for name, orig_name in cameras.items()}
+    gui = DearpyguiUi()
+
+    static_meta = dict(wire.ROBOT_STATIC_META)
+    if task is not None:
+        static_meta['task'] = task
+
+    data_collection = DataCollectionController(
+        operator_position.value,
+        static_meta=static_meta,
+        metadata_getter=lambda: {k: v.tolist() for k, v in sim.save_state().items()},
+    )
+
+    writer_cm = (
+        LocalDatasetWriter(pos3.sync(output_dir, sync_on_error=True)) if output_dir is not None else nullcontext()
+    )
+    with writer_cm as dataset_writer, pimm.World(clock=sim) as world:
+        ds_agent = wire.wire(
+            world, data_collection, dataset_writer, cameras, robot_arm, robot_arm, gui, TimeMode.MESSAGE
+        )
+        _wire(world, ds_agent, data_collection, webxr, robot_arm, sound)
+
+        sim_iter = world.start([sim, mujoco_cameras, robot_arm, data_collection], [webxr, gui, ds_agent, sound])
+        sim_iter = iter(sim_iter)
+
+        start_time = pimm.world.SystemClock().now_ns()
+        sim_start_time = sim.now_ns()
+
+        while not world.should_stop:
+            try:
+                time_since_start = pimm.world.SystemClock().now_ns() - start_time
+                if sim.now_ns() < sim_start_time + time_since_start:
+                    next(sim_iter)
+                else:
+                    time.sleep(0.001)
+            except StopIteration:
+                break
+
+
 @cfn.config(
     robot_arm=positronic.cfg.hardware.roboarm.so101,
     webxr=positronic.cfg.webxr.oculus,
@@ -359,6 +447,17 @@ main_cfg = cfn.Config(
 )
 def so101cfg(robot_arm, **kwargs):
     """Runs data collection on SO101 robot"""
+    main(robot_arm=robot_arm, gripper=robot_arm, **kwargs)
+
+
+@cfn.config(
+    robot_arm=positronic.cfg.hardware.roboarm.piper,
+    webxr=positronic.cfg.webxr.oculus,
+    sound=positronic.cfg.sound.sound,
+    operator_position=OperatorPosition.BACK,
+    cameras={},
+)
+def pipercfg(robot_arm, **kwargs):
     main(robot_arm=robot_arm, gripper=robot_arm, **kwargs)
 
 
@@ -393,7 +492,9 @@ def _internal_main():
     cfn.cli({
         'real': main_cfg,
         'so101': so101cfg,
+        'piper': pipercfg,
         'sim': main_sim,
+        'piper_sim': main_piper_sim,
         'sim_pnp': main_sim.override(loaders=positronic.cfg.simulator.multi_tote_loaders),
         'droid': droid,
         'human': human,

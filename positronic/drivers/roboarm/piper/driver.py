@@ -1,0 +1,210 @@
+import time
+from collections.abc import Iterator
+
+import numpy as np
+from piper_sdk import C_PiperInterface_V2
+
+import pimm
+from positronic import geom
+from positronic.drivers.roboarm import RobotStatus, State
+from positronic.drivers.roboarm import command as roboarm_command
+
+_JOINT_NAMES = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
+_METERS_TO_PIPER_POSITION = 1_000_000.0
+_RADIANS_TO_PIPER_ANGLE = 180_000.0 / np.pi
+_PIPER_POSITION_TO_METERS = 1.0 / _METERS_TO_PIPER_POSITION
+_PIPER_ANGLE_TO_RADIANS = np.pi / 180_000.0
+
+
+class PiperState(State, pimm.shared_memory.NumpySMAdapter):
+    def __init__(self):
+        super().__init__(shape=(6 + 6 + 7 + 1,), dtype=np.float32)
+
+    def instantiation_params(self):
+        return ()
+
+    @property
+    def q(self) -> np.ndarray:
+        return self.array[:6].copy()
+
+    @property
+    def dq(self) -> np.ndarray:
+        return self.array[6:12].copy()
+
+    @property
+    def ee_pose(self) -> geom.Transform3D:
+        return geom.Transform3D(
+            self.array[12 : 12 + 3].copy(), geom.Rotation.from_quat(self.array[12 + 3 : 12 + 7].copy())
+        )
+
+    @property
+    def status(self) -> RobotStatus:
+        return RobotStatus(int(self.array[19]))
+
+    def encode(self, q: np.ndarray, dq: np.ndarray, ee_pose: geom.Transform3D, status: RobotStatus):
+        self.array[:6] = q
+        self.array[6:12] = dq
+        self.array[12 : 12 + 3] = ee_pose.translation
+        self.array[12 + 3 : 12 + 7] = ee_pose.rotation.as_quat
+        self.array[19] = status.value
+
+
+class Robot(pimm.ControlSystem):
+    def __init__(
+        self,
+        can_name: str = 'can0',
+        *,
+        judge_flag: bool = True,
+        can_auto_init: bool = True,
+        dh_is_offset: int = 0x01,
+        start_sdk_joint_limit: bool = True,
+        start_sdk_gripper_limit: bool = True,
+        speed: int = 100,
+        gripper_effort: int = 1000,
+        gripper_range_m: float = 0.08,
+        home_joints: list[float] | None = None,
+    ):
+        self.can_name = can_name
+        self.judge_flag = judge_flag
+        self.can_auto_init = can_auto_init
+        self.dh_is_offset = dh_is_offset
+        self.start_sdk_joint_limit = start_sdk_joint_limit
+        self.start_sdk_gripper_limit = start_sdk_gripper_limit
+        self.speed = speed
+        self.gripper_effort = gripper_effort
+        self.gripper_range_m = gripper_range_m
+        self.home_joints = home_joints if home_joints is not None else [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        self.commands: pimm.SignalReceiver[roboarm_command.CommandType] = pimm.ControlSystemReceiver(self, default=None)
+        self.target_grip: pimm.SignalReceiver[float] = pimm.ControlSystemReceiver(self, default=0.0)
+
+        self.state: pimm.SignalEmitter[PiperState] = pimm.ControlSystemEmitter(self)
+        self.grip: pimm.SignalEmitter[float] = pimm.ControlSystemEmitter(self)
+        self.robot_meta = pimm.ControlSystemEmitter(self)
+
+    def run(self, should_stop: pimm.SignalReceiver, clock: pimm.Clock) -> Iterator[pimm.Sleep]:
+        piper = C_PiperInterface_V2(
+            self.can_name,
+            self.judge_flag,
+            self.can_auto_init,
+            self.dh_is_offset,
+            self.start_sdk_joint_limit,
+            self.start_sdk_gripper_limit,
+        )
+        piper.ConnectPort()
+        while not should_stop.value and not piper.EnablePiper():
+            yield pimm.Sleep(0.01)
+        piper.GripperCtrl(0, self.gripper_effort, 0x01, 0)
+        self.robot_meta.emit({'joint_names': _JOINT_NAMES, 'control_frame': 'end_effector'})
+
+        rate_limiter = pimm.RateLimiter(clock, hz=200)
+        state = PiperState()
+        last_q = self._read_joints(piper)
+        last_ts = clock.now_ns()
+
+        try:
+            while not should_stop.value:
+                cmd_msg = self.commands.read()
+                if cmd_msg.updated:
+                    match cmd_msg.data:
+                        case roboarm_command.Reset():
+                            self._send_joints(piper, np.asarray(self.home_joints, dtype=np.float32))
+                        case roboarm_command.Recover():
+                            piper.EmergencyStop(0x02)
+                            while not should_stop.value and not piper.EnablePiper():
+                                yield pimm.Sleep(0.01)
+                        case roboarm_command.CartesianPosition(pose):
+                            self._send_cartesian(piper, pose)
+                        case roboarm_command.JointPosition(positions):
+                            self._send_joints(piper, np.asarray(positions, dtype=np.float32))
+                        case _:
+                            raise ValueError(f'Unknown command: {cmd_msg.data}')
+
+                grip_msg = self.target_grip.read()
+                if grip_msg.updated:
+                    self._send_gripper(piper, grip_msg.data)
+
+                now = clock.now_ns()
+                q = self._read_joints(piper)
+                dq = self._estimate_velocity(q, last_q, now, last_ts)
+                ee_pose = self._read_ee_pose(piper)
+                status = self._read_status(piper)
+                grip = self._read_gripper(piper)
+
+                state.encode(q, dq, ee_pose, status)
+                self.state.emit(state)
+                self.grip.emit(grip)
+                last_q = q
+                last_ts = now
+
+                yield pimm.Sleep(rate_limiter.wait_time())
+        finally:
+            piper.DisconnectPort()
+
+    def _send_cartesian(self, piper: C_PiperInterface_V2, pose: geom.Transform3D):
+        xyz = np.rint(pose.translation * _METERS_TO_PIPER_POSITION).astype(int)
+        rpy = np.rint(pose.rotation.as_euler * _RADIANS_TO_PIPER_ANGLE).astype(int)
+        piper.MotionCtrl_2(0x01, 0x00, self.speed, 0x00)
+        piper.EndPoseCtrl(int(xyz[0]), int(xyz[1]), int(xyz[2]), int(rpy[0]), int(rpy[1]), int(rpy[2]))
+
+    def _send_joints(self, piper: C_PiperInterface_V2, q: np.ndarray):
+        joints = np.rint(q * _RADIANS_TO_PIPER_ANGLE).astype(int)
+        piper.MotionCtrl_2(0x01, 0x01, self.speed, 0x00)
+        piper.JointCtrl(int(joints[0]), int(joints[1]), int(joints[2]), int(joints[3]), int(joints[4]), int(joints[5]))
+
+    def _send_gripper(self, piper: C_PiperInterface_V2, target_grip: float):
+        grip = min(1.0, max(0.0, float(target_grip)))
+        gripper_angle = round(grip * self.gripper_range_m * _METERS_TO_PIPER_POSITION)
+        piper.GripperCtrl(abs(gripper_angle), self.gripper_effort, 0x01, 0)
+
+    def _read_ee_pose(self, piper: C_PiperInterface_V2) -> geom.Transform3D:
+        pose = piper.GetArmEndPoseMsgs().end_pose
+        translation = np.array([pose.X_axis, pose.Y_axis, pose.Z_axis], dtype=np.float32) * _PIPER_POSITION_TO_METERS
+        rotation = geom.Rotation.from_euler(
+            np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float32) * _PIPER_ANGLE_TO_RADIANS
+        )
+        return geom.Transform3D(translation, rotation)
+
+    def _read_joints(self, piper: C_PiperInterface_V2) -> np.ndarray:
+        joints = piper.GetArmJointMsgs().joint_state
+        return (
+            np.array(
+                [joints.joint_1, joints.joint_2, joints.joint_3, joints.joint_4, joints.joint_5, joints.joint_6],
+                dtype=np.float32,
+            )
+            * _PIPER_ANGLE_TO_RADIANS
+        )
+
+    def _read_gripper(self, piper: C_PiperInterface_V2) -> float:
+        gripper = piper.GetArmGripperMsgs().gripper_state
+        return min(1.0, max(0.0, gripper.grippers_angle * _PIPER_POSITION_TO_METERS / self.gripper_range_m))
+
+    def _read_status(self, piper: C_PiperInterface_V2) -> RobotStatus:
+        arm_status = piper.GetArmStatus().arm_status
+        if arm_status.err_status != 0 or arm_status.arm_status != 0:
+            return RobotStatus.ERROR
+        if arm_status.motion_status != 0:
+            return RobotStatus.MOVING
+        return RobotStatus.AVAILABLE
+
+    def _estimate_velocity(self, q: np.ndarray, last_q: np.ndarray, ts: int, last_ts: int) -> np.ndarray:
+        dt = (ts - last_ts) / 1e9
+        if dt <= 0:
+            return np.zeros(6, dtype=np.float32)
+        return (q - last_q) / dt
+
+
+if __name__ == '__main__':
+    with pimm.World() as world:
+        robot = Robot()
+        commands = world.pair(robot.commands)
+        state = world.pair(robot.state)
+        grip = world.pair(robot.target_grip)
+        world.start([], background=robot)
+
+        while state.read() is None:
+            time.sleep(0.01)
+
+        origin = state.value.ee_pose
+        commands.emit(roboarm_command.CartesianPosition(origin))
+        grip.emit(0.0)

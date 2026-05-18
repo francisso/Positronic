@@ -62,6 +62,7 @@ hardware = [
     # "kortex_api; sys_platform == 'linux'",  # Kinova: disabled, artifactory.kinovaapps.com is unreliable
     "linuxpy",  # For Linux video capture
     "placo",
+    "piper_sdk", # For AgileX Piper arm
     "pyaudio; sys_platform == 'linux'",  # For SoundSystem
     "pymodbus",  # For grippers
     "pyserial", # For grippers
