@@ -80,6 +80,9 @@ class Robot(pimm.ControlSystem):
         speed: int = 100,
         gripper_effort: int = 1000,
         gripper_range_m: float = 0.08,
+        cartesian_rotation_mode: str = 'fixed',
+        fixed_cartesian_rpy_deg: list[float] | None = None,
+        max_cartesian_step_m: float = 0.01,
         home_joints: list[float] | None = None,
     ):
         self.can_name = can_name
@@ -91,7 +94,11 @@ class Robot(pimm.ControlSystem):
         self.speed = speed
         self.gripper_effort = gripper_effort
         self.gripper_range_m = gripper_range_m
+        self.cartesian_rotation_mode = cartesian_rotation_mode
+        self.fixed_cartesian_rpy = np.deg2rad(fixed_cartesian_rpy_deg or [0.0, 85.0, 0.0])
+        self.max_cartesian_step_m = max_cartesian_step_m
         self.home_joints = home_joints if home_joints is not None else [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        self._last_cartesian_target: geom.Transform3D | None = None
 
         self.commands: pimm.SignalReceiver[roboarm_command.CommandType] = pimm.ControlSystemReceiver(self, default=None)
         self.target_grip: pimm.SignalReceiver[float] = pimm.ControlSystemReceiver(self, default=0.0)
@@ -133,10 +140,7 @@ class Robot(pimm.ControlSystem):
                             _log.info('CMD Reset -> home joints=%s', self.home_joints)
                             self._send_joints(piper, np.asarray(self.home_joints, dtype=np.float32))
                         case roboarm_command.Recover():
-                            _log.warning(
-                                'CMD Recover -> EmergencyStop(0x02) (note: 0x02 == ResetPiper = motors lose power)'
-                            )
-                            piper.EmergencyStop(0x02)
+                            _log.warning('CMD Recover -> EnablePiper')
                             while not should_stop.value and not piper.EnablePiper():
                                 yield pimm.Sleep(0.01)
                             _log.info('Recover: arm re-enabled. enable_status=%s', piper.GetArmEnableStatus())
@@ -174,6 +178,7 @@ class Robot(pimm.ControlSystem):
             piper.DisconnectPort()
 
     def _send_cartesian(self, piper: C_PiperInterface_V2, pose: geom.Transform3D):
+        pose = self._prepare_cartesian_pose(piper, pose)
         xyz = np.rint(pose.translation * _METERS_TO_PIPER_POSITION).astype(int)
         rpy = np.rint(pose.rotation.as_euler * _RADIANS_TO_PIPER_ANGLE).astype(int)
         _log.debug(
@@ -185,6 +190,34 @@ class Robot(pimm.ControlSystem):
         )
         piper.MotionCtrl_2(0x01, 0x00, self.speed, 0x00)
         piper.EndPoseCtrl(int(xyz[0]), int(xyz[1]), int(xyz[2]), int(rpy[0]), int(rpy[1]), int(rpy[2]))
+        self._last_cartesian_target = pose
+
+    def _prepare_cartesian_pose(self, piper: C_PiperInterface_V2, pose: geom.Transform3D) -> geom.Transform3D:
+        if self._last_cartesian_target is None:
+            self._last_cartesian_target = self._read_ee_pose(piper)
+
+        translation = self._limit_translation_step(self._last_cartesian_target.translation, pose.translation)
+        match self.cartesian_rotation_mode:
+            case 'command':
+                rotation = pose.rotation
+            case 'current':
+                rotation = self._read_ee_pose(piper).rotation
+            case 'fixed':
+                rotation = geom.Rotation.from_euler(self.fixed_cartesian_rpy)
+            case _:
+                raise ValueError(f'Unknown cartesian_rotation_mode={self.cartesian_rotation_mode!r}')
+
+        return geom.Transform3D(translation, rotation)
+
+    def _limit_translation_step(self, start: np.ndarray, target: np.ndarray) -> np.ndarray:
+        if self.max_cartesian_step_m <= 0:
+            return target
+
+        delta = target - start
+        distance = np.linalg.norm(delta)
+        if distance <= self.max_cartesian_step_m:
+            return target
+        return start + delta / distance * self.max_cartesian_step_m
 
     def _send_joints(self, piper: C_PiperInterface_V2, q: np.ndarray):
         joints = np.rint(q * _RADIANS_TO_PIPER_ANGLE).astype(int)
@@ -221,7 +254,7 @@ class Robot(pimm.ControlSystem):
 
     def _classify_status(self, arm_status) -> RobotStatus:
         # `arm_status.err_status` is an ErrStatus object — never compare to 0 directly.
-        if any(vars(arm_status.err_status).values()) or int(arm_status.arm_status) != 0:
+        if int(arm_status.err_code) != 0 or any(vars(arm_status.err_status).values()):
             return RobotStatus.ERROR
         if int(arm_status.motion_status) != 0:
             return RobotStatus.MOVING

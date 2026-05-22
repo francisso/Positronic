@@ -52,9 +52,12 @@ def so101(motor_bus):
     dh_is_offset=0x01,
     start_sdk_joint_limit=True,
     start_sdk_gripper_limit=True,
-    speed=100,
+    speed=30,
     gripper_effort=1000,
     gripper_range_m=0.08,
+    cartesian_rotation_mode='fixed',
+    fixed_cartesian_rpy_deg=[0.0, 85.0, 0.0],
+    max_cartesian_step_m=0.01,
     home_joints=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
 )
 def piper(
@@ -67,6 +70,9 @@ def piper(
     speed: int,
     gripper_effort: int,
     gripper_range_m: float,
+    cartesian_rotation_mode: str,
+    fixed_cartesian_rpy_deg: list[float],
+    max_cartesian_step_m: float,
     home_joints: list[float],
 ):
     from positronic.drivers.roboarm.piper.driver import Robot
@@ -81,5 +87,8 @@ def piper(
         speed=speed,
         gripper_effort=gripper_effort,
         gripper_range_m=gripper_range_m,
+        cartesian_rotation_mode=cartesian_rotation_mode,
+        fixed_cartesian_rpy_deg=fixed_cartesian_rpy_deg,
+        max_cartesian_step_m=max_cartesian_step_m,
         home_joints=home_joints,
     )

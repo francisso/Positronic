@@ -107,10 +107,21 @@ class MujocoPiperState(State, pimm.shared_memory.NumpySMAdapter):
 
 
 class MujocoPiper(pimm.ControlSystem):
-    def __init__(self, sim: MujocoSim, urdf_path: str | Path):
+    def __init__(
+        self,
+        sim: MujocoSim,
+        urdf_path: str | Path,
+        *,
+        cartesian_rotation_mode: str = 'current',
+        rot_weight: float = 0.0,
+        max_joint_step: float = 0.05,
+    ):
         self.sim = sim
         self.physics = dm_mujoco.Physics.from_model(sim.data)
         self.urdf_path = Path(urdf_path).expanduser()
+        self.cartesian_rotation_mode = cartesian_rotation_mode
+        self.rot_weight = rot_weight
+        self.max_joint_step = max_joint_step
         self.ee_name = PIPER_CONTROL_FRAME
         self.joint_names = PIPER_JOINT_NAMES
         self.actuator_names = PIPER_JOINT_NAMES
@@ -141,7 +152,7 @@ class MujocoPiper(pimm.ControlSystem):
             if cmd_msg.updated:
                 match cmd_msg.data:
                     case roboarm_command.CartesianPosition(pose=pose):
-                        q = self._recalculate_ik(pose)
+                        q = self._recalculate_ik(self._prepare_cartesian_pose(pose))
                         if q is None:
                             state.set_error()
                         else:
@@ -176,13 +187,31 @@ class MujocoPiper(pimm.ControlSystem):
             target_pos=target_robot_position.translation,
             target_quat=target_robot_position.rotation.as_quat,
             joint_names=self.joint_names,
-            rot_weight=0.5,
+            rot_weight=self.rot_weight,
         )
 
         if result.success:
-            return result.qpos[self.joint_qpos_ids]
+            return self._limit_joint_step(result.qpos[self.joint_qpos_ids])
 
         return None
+
+    def _prepare_cartesian_pose(self, pose: geom.Transform3D) -> geom.Transform3D:
+        match self.cartesian_rotation_mode:
+            case 'command':
+                rotation = pose.rotation
+            case 'current':
+                rotation = self.ee_pose.rotation
+            case _:
+                raise ValueError(f'Unknown cartesian_rotation_mode={self.cartesian_rotation_mode!r}')
+
+        return geom.Transform3D(pose.translation, rotation)
+
+    def _limit_joint_step(self, target: np.ndarray) -> np.ndarray:
+        if self.max_joint_step <= 0:
+            return target
+
+        delta = np.clip(target - self.q, -self.max_joint_step, self.max_joint_step)
+        return self.q + delta
 
     @property
     def q(self) -> np.ndarray:
