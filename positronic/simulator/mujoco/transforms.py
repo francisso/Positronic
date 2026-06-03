@@ -41,7 +41,32 @@ class AddCameras(MujocoSceneTransform):
 
         for camera_name, camera_cfg in self.additional_cameras.items():
             spec.worldbody.add_camera(
-                name=f'{camera_name}{model_suffix}', pos=camera_cfg['pos'], xyaxes=camera_cfg['xyaxes']
+                name=f'{camera_name}{model_suffix}',
+                pos=camera_cfg['pos'],
+                xyaxes=camera_cfg['xyaxes'],
+                fovy=camera_cfg.get('fovy'),
+            )
+
+        return spec
+
+
+class AddBodyCameras(MujocoSceneTransform):
+    def __init__(self, body_name: str, cameras: dict[str, dict[str, Any]]):
+        self.body_name = body_name
+        self.cameras = cameras
+
+    def apply(self, spec: mujoco.MjSpec) -> mujoco.MjSpec:
+        metadata = {s.name: s.data for s in spec.texts}
+        model_suffix = metadata.get('model_suffix', '')
+        bodies = [body for body in spec.bodies if body.name == self.body_name]
+        assert len(bodies) == 1, f'Expected 1 body with name {self.body_name}, found {len(bodies)}'
+
+        for camera_name, camera_cfg in self.cameras.items():
+            bodies[0].add_camera(
+                name=f'{camera_name}{model_suffix}',
+                pos=camera_cfg['pos'],
+                xyaxes=camera_cfg['xyaxes'],
+                fovy=camera_cfg.get('fovy'),
             )
 
         return spec

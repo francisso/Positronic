@@ -26,6 +26,7 @@ dependencies = [
     "jinja2",
     "fire",
     "httpx",
+    "ikpy==3.4.2",
     "msgpack",
     "mujoco",
     "numpy",
@@ -67,6 +68,7 @@ hardware = [
     "pymodbus",  # For grippers
     "pyserial", # For grippers
     "pyzed; sys_platform == 'linux'",  # ZED camera support
+    "xarm-python-sdk==1.17.3", # For UFACTORY xArm arms
 ]
 lerobot_0_3_3 = [
     "lerobot==0.3.3",

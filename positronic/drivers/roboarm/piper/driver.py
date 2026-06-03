@@ -80,7 +80,7 @@ class Robot(pimm.ControlSystem):
         speed: int = 100,
         gripper_effort: int = 1000,
         gripper_range_m: float = 0.08,
-        cartesian_rotation_mode: str = 'fixed',
+        cartesian_rotation_mode: str = 'command',
         fixed_cartesian_rpy_deg: list[float] | None = None,
         max_cartesian_step_m: float = 0.01,
         home_joints: list[float] | None = None,

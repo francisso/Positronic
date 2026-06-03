@@ -108,7 +108,7 @@ class WebXR(pimm.ControlSystem):
     - `/ws`              -> JSON controller stream from client to server
     - `/video`           -> optional base64 JPEG frames (server to client)
     - Shared assets: `/three.min.js`, `/webxr-button.js`, `/core.js`
-    - Oculus-only: `/video-player.js`
+    - Video overlay: `/video-player.js`
 
     Parameters
     - port: TCP port to bind.
@@ -143,7 +143,7 @@ class WebXR(pimm.ControlSystem):
         jpeg_encoder = turbojpeg.TurboJPEG()
 
         def encode_frame(image):
-            buffer = jpeg_encoder.encode(image, quality=50)
+            buffer = jpeg_encoder.encode(image, quality=50, pixel_format=turbojpeg.TJPF_RGB)
             return base64.b64encode(buffer).decode('utf-8')
 
         @app.get('/')
@@ -165,11 +165,9 @@ class WebXR(pimm.ControlSystem):
         async def webxr_core():
             return FileResponse('positronic/assets/webxr/core.js')
 
-        if self.frontend == 'oculus':
-
-            @app.get('/video-player.js')
-            async def video_player():
-                return FileResponse('positronic/assets/webxr/video-player.js')
+        @app.get('/video-player.js')
+        async def video_player():
+            return FileResponse('positronic/assets/webxr/video-player.js')
 
         @app.websocket('/video')
         async def video_stream(websocket: WebSocket):

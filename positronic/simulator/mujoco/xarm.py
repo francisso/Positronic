@@ -12,59 +12,76 @@ import pimm
 from positronic import geom
 from positronic.drivers.roboarm import RobotStatus, State
 from positronic.drivers.roboarm import command as roboarm_command
+from positronic.drivers.roboarm.xarm6.kinematics import XArm6IKSolver
 from positronic.simulator.mujoco.sim import MujocoSim
 
-PIPER_JOINT_NAMES = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
-PIPER_GRIPPER_JOINT_NAMES = ['joint7', 'joint8']
-PIPER_CONTROL_FRAME = 'end_effector'
+XARM6_JOINT_NAMES = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
+XARM6_CONTROL_FRAME = 'end_effector'
+XARM6_DEFAULT_HOME = [0.0, -0.6, -0.6, 0.0, 1.2, 0.0]
 
 
-def materialize_piper_mujoco_model(
-    mujoco_model_path: str | Path, urdf_path: str | Path, initial_ctrl: list[float] | None = None
-) -> str:
-    source_path = Path(mujoco_model_path).expanduser().resolve()
-    root = ET.parse(source_path).getroot()
+def materialize_xarm6_mujoco_model(urdf_path: str | Path, initial_ctrl: list[float] | None = None) -> str:
+    source_path = Path(urdf_path).expanduser().resolve()
+    temp_urdf_path = _rewrite_mesh_paths(source_path)
+    spec = mj.MjSpec.from_file(temp_urdf_path)
+    spec.compiler.balanceinertia = True
+    spec.option.integrator = mj.mjtIntegrator.mjINT_IMPLICITFAST
+    _add_end_effector_site(spec)
+    _add_position_actuators(spec)
+    spec.add_text(name='initial_ctrl', data=','.join(str(v) for v in (initial_ctrl or XARM6_DEFAULT_HOME)))
 
-    for mesh in root.findall('./asset/mesh'):
-        mesh_file = mesh.get('file')
-        if mesh_file is None or Path(mesh_file).is_absolute():
+    with tempfile.NamedTemporaryFile('w', suffix='.xml', prefix='positronic_xarm6_', delete=False) as f:
+        f.write(spec.to_xml())
+        return f.name
+
+
+def _rewrite_mesh_paths(urdf_path: Path) -> str:
+    description_dir = urdf_path.parent
+    root = ET.parse(urdf_path).getroot()
+
+    for mesh in root.findall('.//mesh'):
+        filename = mesh.get('filename')
+        if filename is None:
             continue
-        mesh.set('file', str((source_path.parent / mesh_file).resolve()))
+        mesh.set('filename', str(_local_mesh_path(description_dir, filename)))
 
-    _ensure_custom_text(root, 'initial_ctrl', ','.join(str(v) for v in (initial_ctrl or [0.0] * 8)))
-    _ensure_end_effector_site(root)
-
-    with tempfile.NamedTemporaryFile('w', suffix='.xml', prefix='positronic_piper_', delete=False) as f:
+    with tempfile.NamedTemporaryFile('w', suffix='.urdf', prefix='positronic_xarm6_', delete=False) as f:
         ET.ElementTree(root).write(f, encoding='unicode')
-        temp_path = f.name
-
-    return temp_path
+        return f.name
 
 
-def _ensure_custom_text(root: ET.Element, name: str, data: str):
-    custom = root.find('custom')
-    if custom is None:
-        custom = ET.SubElement(root, 'custom')
+def _local_mesh_path(description_dir: Path, filename: str) -> Path:
+    mesh_name = Path(filename).name
+    stem = Path(mesh_name).stem.removesuffix('_vhacd')
+    if stem == 'base':
+        stem = 'link_base'
 
-    text = custom.find(f"text[@name='{name}']")
-    if text is None:
-        ET.SubElement(custom, 'text', name=name, data=data)
-    else:
-        text.set('data', data)
+    if '/visual/' in filename:
+        return (description_dir / 'visual' / f'{stem}.stl').resolve()
+    if '/collision/' in filename:
+        return (description_dir / 'collision' / f'{stem}.obj').resolve()
 
-
-def _ensure_end_effector_site(root: ET.Element):
-    for body in root.iter('body'):
-        if body.get('name') != 'link6':
-            continue
-        if body.find(f"site[@name='{PIPER_CONTROL_FRAME}']") is None:
-            ET.SubElement(body, 'site', name=PIPER_CONTROL_FRAME, pos='0 0 0.1358', size='0.01', rgba='1 0 0 1')
-        return
-
-    raise ValueError('Could not find Piper link6 body to attach end-effector site')
+    return (description_dir / mesh_name).resolve()
 
 
-class MujocoPiperState(State, pimm.shared_memory.NumpySMAdapter):
+def _add_end_effector_site(spec: mj.MjSpec):
+    link6 = spec.body('link6')
+    link6.add_site(name=XARM6_CONTROL_FRAME, pos=[0.0, 0.0, 0.0], size=[0.01], rgba=[1.0, 0.0, 0.0, 1.0])
+
+
+def _add_position_actuators(spec: mj.MjSpec):
+    for joint_name in XARM6_JOINT_NAMES:
+        joint = spec.joint(joint_name)
+        actuator = spec.add_actuator(name=joint_name, target=joint_name)
+        actuator.trntype = mj.mjtTrn.mjTRN_JOINT
+        actuator.set_to_position(kp=600.0, kv=80.0)
+        actuator.ctrllimited = True
+        actuator.ctrlrange = joint.range
+        actuator.forcelimited = True
+        actuator.forcerange = [-250.0, 250.0]
+
+
+class MujocoXArm6State(State, pimm.shared_memory.NumpySMAdapter):
     def __init__(self):
         super().__init__(shape=(6 + 6 + 7 + 1,), dtype=np.float32)
         self.array.fill(0.0)
@@ -106,7 +123,7 @@ class MujocoPiperState(State, pimm.shared_memory.NumpySMAdapter):
         self.array[19] = status.value
 
 
-class MujocoPiper(pimm.ControlSystem):
+class MujocoXArm6(pimm.ControlSystem):
     def __init__(
         self,
         sim: MujocoSim,
@@ -116,20 +133,20 @@ class MujocoPiper(pimm.ControlSystem):
         rot_weight: float = 0.2,
         max_joint_step: float = 0.05,
         fixed_cartesian_rpy_deg: list[float] | None = None,
+        ik_solver: str = 'fresenius',
     ):
         self.sim = sim
         self.physics = dm_mujoco.Physics.from_model(sim.data)
         self.urdf_path = Path(urdf_path).expanduser()
+        self.solver = XArm6IKSolver(self.urdf_path)
+        self.ik_solver = ik_solver
         self.cartesian_rotation_mode = cartesian_rotation_mode
         self.rot_weight = rot_weight
         self.max_joint_step = max_joint_step
-        self.ee_name = PIPER_CONTROL_FRAME
-        self.joint_names = PIPER_JOINT_NAMES
-        self.actuator_names = PIPER_JOINT_NAMES
-        self.gripper_joint_names = PIPER_GRIPPER_JOINT_NAMES
-        self.gripper_actuator_names = PIPER_GRIPPER_JOINT_NAMES
+        self.ee_name = XARM6_CONTROL_FRAME
+        self.joint_names = XARM6_JOINT_NAMES
+        self.actuator_names = XARM6_JOINT_NAMES
         self.joint_qpos_ids = [self.sim.model.joint(joint).qposadr.item() for joint in self.joint_names]
-        self.gripper_qpos_ids = [self.sim.model.joint(joint).qposadr.item() for joint in self.gripper_joint_names]
         self.fixed_cartesian_rotation = (
             geom.Rotation.from_euler(np.deg2rad(fixed_cartesian_rpy_deg))
             if fixed_cartesian_rpy_deg is not None
@@ -137,10 +154,8 @@ class MujocoPiper(pimm.ControlSystem):
         )
 
         self.commands: pimm.SignalReceiver[roboarm_command.CommandType] = pimm.ControlSystemReceiver(self, default=None)
-        self.target_grip: pimm.SignalReceiver[float] = pimm.ControlSystemReceiver(self, default=0.0)
 
-        self.state: pimm.SignalEmitter[MujocoPiperState] = pimm.ControlSystemEmitter(self)
-        self.grip: pimm.SignalEmitter[float] = pimm.ControlSystemEmitter(self)
+        self.state: pimm.SignalEmitter[MujocoXArm6State] = pimm.ControlSystemEmitter(self)
         self.robot_meta = pimm.ControlSystemEmitter(self)
 
     def run(self, should_stop: pimm.SignalReceiver, clock: pimm.Clock) -> Iterator[pimm.Sleep]:
@@ -149,7 +164,7 @@ class MujocoPiper(pimm.ControlSystem):
             'joint_names': self.joint_names,
             'control_frame': self.ee_name,
         })
-        state = MujocoPiperState()
+        state = MujocoXArm6State()
 
         while not should_stop.value:
             state.encode(self.q, self.dq, self.ee_pose)
@@ -178,15 +193,25 @@ class MujocoPiper(pimm.ControlSystem):
                     case _:
                         raise ValueError(f'Unknown command type: {type(cmd_msg.data)}')
 
-            grip_msg = self.target_grip.read()
-            if grip_msg.updated:
-                self.set_target_grip(grip_msg.data)
-
             self.state.emit(state)
-            self.grip.emit(self.current_grip)
             yield pimm.Pass()
 
     def _recalculate_ik(self, target_robot_position: geom.Transform3D) -> np.ndarray | None:
+        match self.ik_solver:
+            case 'fresenius':
+                return self._recalculate_fresenius_ik(target_robot_position)
+            case 'mujoco':
+                return self._recalculate_mujoco_ik(target_robot_position)
+            case _:
+                raise ValueError(f'Unknown ik_solver={self.ik_solver!r}')
+
+    def _recalculate_fresenius_ik(self, target_robot_position: geom.Transform3D) -> np.ndarray | None:
+        result = self.solver.ik_from_transform(target_robot_position, initial_guess=self.q)
+        if result is None:
+            return None
+        return self._limit_joint_step(result)
+
+    def _recalculate_mujoco_ik(self, target_robot_position: geom.Transform3D) -> np.ndarray | None:
         result = ik.qpos_from_site_pose(
             physics=self.physics,
             site_name=self.ee_name,
@@ -237,27 +262,7 @@ class MujocoPiper(pimm.ControlSystem):
         mj.mju_mat2Quat(quat, rotmat)
         return geom.Transform3D(translation=translation, rotation=geom.Rotation.from_quat(quat))
 
-    @property
-    def current_grip(self) -> float:
-        min_grip, max_grip = self.sim.model.actuator(self.gripper_actuator_names[0]).ctrlrange
-        current = self.sim.data.qpos[self.gripper_qpos_ids[0]].item()
-        return min(1.0, max(0.0, (current - min_grip) / (max_grip - min_grip)))
-
     def set_arm_actuator_values(self, actuator_values: np.ndarray):
         for actuator_name, value in zip(self.actuator_names, actuator_values, strict=True):
-            self._set_actuator_value(actuator_name, value)
-
-    def set_target_grip(self, target_grip: float):
-        grip = min(1.0, max(0.0, float(target_grip)))
-        joint7_range = self.sim.model.actuator(self.gripper_actuator_names[0]).ctrlrange
-        joint8_range = self.sim.model.actuator(self.gripper_actuator_names[1]).ctrlrange
-        self._set_actuator_value(
-            self.gripper_actuator_names[0], joint7_range[0] + grip * (joint7_range[1] - joint7_range[0])
-        )
-        self._set_actuator_value(
-            self.gripper_actuator_names[1], joint8_range[1] + grip * (joint8_range[0] - joint8_range[1])
-        )
-
-    def _set_actuator_value(self, actuator_name: str, value: float):
-        ctrlrange = self.sim.model.actuator(actuator_name).ctrlrange
-        self.sim.data.actuator(actuator_name).ctrl = min(ctrlrange[1], max(ctrlrange[0], value))
+            ctrlrange = self.sim.model.actuator(actuator_name).ctrlrange
+            self.sim.data.actuator(actuator_name).ctrl = min(ctrlrange[1], max(ctrlrange[0], value))

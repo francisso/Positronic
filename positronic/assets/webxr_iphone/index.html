@@ -79,9 +79,11 @@
     </div>
 
     <script type="module">
+      import { WebXRVideoPlayer } from './video-player.js';
       import { initWebSocket, startXRApp } from '/core.js';
 
       let websocket = null;
+      let videoPlayer = null;
 
       // Buttons array: indices used: 0 (trigger/gripper), 3 (stick/reset), 4 (A), 5 (B)
       const buttons = new Array(8).fill(0.0);
@@ -256,8 +258,9 @@
         window.addEventListener('touchcancel', () => releaseAll(true));
       }
 
-      function onInit() {
-        // Nothing specific to initialize in 3D scene for iPhone
+      function onInit({ scene, camera }) {
+        videoPlayer = new WebXRVideoPlayer({ mode: 'screen' });
+        videoPlayer.init(scene, camera);
       }
 
       function onFrame({ view }) {
@@ -269,6 +272,7 @@
           left: null,
           right: { position: [p.x, p.y, p.z], orientation: [q.w, q.x, q.y, q.z], buttons: btns }
         };
+        if (videoPlayer) videoPlayer.update();
         return controllers;
       }
 

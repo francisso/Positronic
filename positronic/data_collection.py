@@ -26,6 +26,7 @@ from positronic.gui.dpg import DearpyguiUi
 from positronic.simulator.mujoco.piper import MujocoPiper, materialize_piper_mujoco_model
 from positronic.simulator.mujoco.sim import MujocoCameras, MujocoFranka, MujocoGripper, MujocoSim
 from positronic.simulator.mujoco.transforms import MujocoSceneTransform
+from positronic.simulator.mujoco.xarm import XARM6_DEFAULT_HOME, MujocoXArm6, materialize_xarm6_mujoco_model
 from positronic.utils import package_assets_path
 from positronic.utils.buttons import ButtonHandler
 from positronic.utils.logging import init_logging
@@ -198,6 +199,10 @@ def _wrench_to_level(state: RoboarmState) -> float | None:
     return np.linalg.norm(state.ee_wrench)
 
 
+def _camera_adapter_array(adapter):
+    return adapter.array
+
+
 def _wire(
     world: pimm.World,
     ds_agent: DsWriterAgent | None,
@@ -255,9 +260,7 @@ def main(
 
         if stream_video_to_webxr is not None:
             world.connect(
-                camera_emitters[stream_video_to_webxr],
-                webxr.frame,
-                receiver_wrapper=pimm.map(lambda adapter: adapter.array),
+                camera_emitters[stream_video_to_webxr], webxr.frame, receiver_wrapper=pimm.map(_camera_adapter_array)
             )
 
         dc_steps = iter(world.start(data_collection, bg_cs))
@@ -379,6 +382,10 @@ def piper_stack_cubes_loaders():
     sound=positronic.cfg.sound.sound,
     operator_position=OperatorPosition.BACK,
     loaders=piper_stack_cubes_loaders,
+    cartesian_rotation_mode='command',
+    rot_weight=0.2,
+    max_joint_step=0.05,
+    fixed_cartesian_rpy_deg=None,
 )
 def main_piper_sim(
     urdf_path: str,
@@ -391,13 +398,24 @@ def main_piper_sim(
     fps: int = 30,
     operator_position: OperatorPosition = OperatorPosition.FRONT,
     task: str | None = None,
+    cartesian_rotation_mode: str = 'command',
+    rot_weight: float = 0.2,
+    max_joint_step: float = 0.05,
+    fixed_cartesian_rpy_deg: list[float] | None = None,
 ):
     if mujoco_model_path is None:
         mujoco_model_path = str(Path(urdf_path).expanduser().parents[1] / 'mujoco_model/piper_description.xml')
 
     model_path = materialize_piper_mujoco_model(mujoco_model_path, urdf_path)
     sim = MujocoSim(model_path, loaders)
-    robot_arm = MujocoPiper(sim, urdf_path)
+    robot_arm = MujocoPiper(
+        sim,
+        urdf_path,
+        cartesian_rotation_mode=cartesian_rotation_mode,
+        rot_weight=rot_weight,
+        max_joint_step=max_joint_step,
+        fixed_cartesian_rpy_deg=fixed_cartesian_rpy_deg,
+    )
     mujoco_cameras = MujocoCameras(sim.model, sim.data, resolution=(320, 240), fps=fps)
     cameras = {name: mujoco_cameras.cameras[orig_name] for name, orig_name in cameras.items()}
     gui = DearpyguiUi()
@@ -420,6 +438,142 @@ def main_piper_sim(
             world, data_collection, dataset_writer, cameras, robot_arm, robot_arm, gui, TimeMode.MESSAGE
         )
         _wire(world, ds_agent, data_collection, webxr, robot_arm, sound)
+
+        sim_iter = world.start([sim, mujoco_cameras, robot_arm, data_collection], [webxr, gui, ds_agent, sound])
+        sim_iter = iter(sim_iter)
+
+        start_time = pimm.world.SystemClock().now_ns()
+        sim_start_time = sim.now_ns()
+
+        while not world.should_stop:
+            try:
+                time_since_start = pimm.world.SystemClock().now_ns() - start_time
+                if sim.now_ns() < sim_start_time + time_since_start:
+                    next(sim_iter)
+                else:
+                    time.sleep(0.001)
+            except StopIteration:
+                break
+
+
+@cfn.config()
+def xarm6_stack_cubes_loaders():
+    from positronic.simulator.mujoco.transforms import AddBodyCameras, AddBox, AddCameras, SetBodyPosition
+
+    return [
+        AddCameras(
+            additional_cameras={
+                'side_view': {
+                    'pos': [1.55, -1.55, 1.05],
+                    'xyaxes': [0.707, 0.707, 0.000, -0.408, 0.408, 0.816],
+                    'fovy': 70,
+                },
+                'front_view': {
+                    'pos': [1.65, 0.00, 0.95],
+                    'xyaxes': [0.000, 1.000, 0.000, -0.500, 0.000, 0.866],
+                    'fovy': 70,
+                },
+                'side_view_2': {
+                    'pos': [1.55, 1.55, 1.05],
+                    'xyaxes': [-0.707, 0.707, 0.000, -0.408, -0.408, 0.816],
+                    'fovy': 70,
+                },
+            }
+        ),
+        AddBodyCameras(
+            body_name='link6',
+            cameras={
+                'wrist_view': {
+                    'pos': [-0.05, 0.03, 0.015],
+                    'xyaxes': [0.000, 1.000, 0.000, 1.000, 0.000, -0.200],
+                    'fovy': 90,
+                }
+            },
+        ),
+        AddBox(name='table', size=[0.35, 0.35, 0.02], pos=[0.42, 0.0, 0.10], rgba=[0.65, 0.65, 0.65, 1]),
+        AddBox(name='box_0', size=[0.02, 0.02, 0.01], pos=[0.0, 0.0, 0.01], rgba=[1, 0, 0, 1], freejoint=True),
+        SetBodyPosition(body_name='box_0_body', random_position=[[0.25, -0.18, 0.13], [0.54, 0.18, 0.13]]),
+        AddBox(name='box_1', size=[0.02, 0.02, 0.01], pos=[0.0, 0.0, 0.01], rgba=[0, 1, 0, 1], freejoint=True),
+        SetBodyPosition(body_name='box_1_body', random_position=[[0.25, -0.18, 0.13], [0.54, 0.18, 0.13]]),
+    ]
+
+
+@cfn.config(
+    urdf_path=str(Path(__file__).resolve().parents[1] / 'xarm6_description/xarm6.urdf'),
+    home_joints=XARM6_DEFAULT_HOME,
+    webxr=positronic.cfg.webxr.oculus,
+    cameras={
+        'image.exterior': 'side_view',
+        'image.agent_view': 'front_view',
+        'image.side': 'side_view_2',
+        'image.wrist': 'wrist_view',
+    },
+    sound=positronic.cfg.sound.sound,
+    operator_position=OperatorPosition.BACK,
+    loaders=xarm6_stack_cubes_loaders,
+    cartesian_rotation_mode='command',
+    rot_weight=0.2,
+    max_joint_step=0.12,
+    fixed_cartesian_rpy_deg=None,
+    ik_solver='fresenius',
+    stream_video_to_webxr=None,
+)
+def main_xarm6_sim(
+    urdf_path: str,
+    home_joints: list[float],
+    webxr: WebXR,
+    cameras: dict[str, str],
+    sound: pimm.ControlSystem | None = None,
+    loaders: Sequence[MujocoSceneTransform] = (),
+    output_dir: str | None = None,
+    fps: int = 30,
+    operator_position: OperatorPosition = OperatorPosition.FRONT,
+    task: str | None = None,
+    cartesian_rotation_mode: str = 'command',
+    rot_weight: float = 0.2,
+    max_joint_step: float = 0.12,
+    fixed_cartesian_rpy_deg: list[float] | None = None,
+    ik_solver: str = 'fresenius',
+    stream_video_to_webxr: str | None = None,
+):
+    model_path = materialize_xarm6_mujoco_model(urdf_path, initial_ctrl=home_joints)
+    sim = MujocoSim(model_path, loaders)
+    robot_arm = MujocoXArm6(
+        sim,
+        urdf_path,
+        cartesian_rotation_mode=cartesian_rotation_mode,
+        rot_weight=rot_weight,
+        max_joint_step=max_joint_step,
+        fixed_cartesian_rpy_deg=fixed_cartesian_rpy_deg,
+        ik_solver=ik_solver,
+    )
+    mujoco_cameras = MujocoCameras(sim.model, sim.data, resolution=(320, 240), fps=fps)
+    cameras = {name: mujoco_cameras.cameras[orig_name] for name, orig_name in cameras.items()}
+    gui = DearpyguiUi()
+
+    static_meta = dict(wire.ROBOT_STATIC_META)
+    if task is not None:
+        static_meta['task'] = task
+
+    data_collection = DataCollectionController(
+        operator_position.value,
+        static_meta=static_meta,
+        metadata_getter=lambda: {k: v.tolist() for k, v in sim.save_state().items()},
+    )
+
+    writer_cm = (
+        LocalDatasetWriter(pos3.sync(output_dir, sync_on_error=True)) if output_dir is not None else nullcontext()
+    )
+    with writer_cm as dataset_writer, pimm.World(clock=sim) as world:
+        ds_agent = wire.wire(world, data_collection, dataset_writer, cameras, robot_arm, None, gui, TimeMode.MESSAGE)
+        _wire(world, ds_agent, data_collection, webxr, robot_arm, sound)
+
+        if stream_video_to_webxr is not None:
+            if stream_video_to_webxr not in cameras:
+                raise ValueError(
+                    f'Unknown stream_video_to_webxr={stream_video_to_webxr!r}. Available cameras: {list(cameras)}'
+                )
+            world.connect(cameras[stream_video_to_webxr], webxr.frame, receiver_wrapper=pimm.map(_camera_adapter_array))
 
         sim_iter = world.start([sim, mujoco_cameras, robot_arm, data_collection], [webxr, gui, ds_agent, sound])
         sim_iter = iter(sim_iter)
@@ -468,6 +622,24 @@ def pipercfg(robot_arm, **kwargs):
     main(robot_arm=robot_arm, gripper=robot_arm, **kwargs)
 
 
+@cfn.config(
+    robot_arm=positronic.cfg.hardware.roboarm.xarm6,
+    webxr=positronic.cfg.webxr.oculus,
+    sound=positronic.cfg.sound.sound,
+    operator_position=OperatorPosition.BACK,
+    cameras={
+        'image.usb': positronic.cfg.hardware.camera.opencv.override(
+            camera_id=0, width=640, height=480, fps=30, buffer_size=1, auto_wb=0, wb_temperature=6000
+        ),
+        'image.zed': positronic.cfg.hardware.camera.zed.override(
+            view='left', resolution='hd720', fps=30, output_width=640, output_height=480
+        ),
+    },
+)
+def xarm6cfg(robot_arm, **kwargs):
+    main(robot_arm=robot_arm, gripper=robot_arm, **kwargs)
+
+
 droid = cfn.Config(
     main,
     robot_arm=positronic.cfg.hardware.roboarm.franka_droid,
@@ -500,8 +672,10 @@ def _internal_main():
         'real': main_cfg,
         'so101': so101cfg,
         'piper': pipercfg,
+        'xarm6': xarm6cfg,
         'sim': main_sim,
         'piper_sim': main_piper_sim,
+        'xarm6_sim': main_xarm6_sim,
         'sim_pnp': main_sim.override(loaders=positronic.cfg.simulator.multi_tote_loaders),
         'droid': droid,
         'human': human,

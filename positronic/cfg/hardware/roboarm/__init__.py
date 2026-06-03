@@ -55,7 +55,7 @@ def so101(motor_bus):
     speed=30,
     gripper_effort=1000,
     gripper_range_m=0.08,
-    cartesian_rotation_mode='fixed',
+    cartesian_rotation_mode='command',
     fixed_cartesian_rpy_deg=[0.0, 85.0, 0.0],
     max_cartesian_step_m=0.01,
     home_joints=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -91,4 +91,53 @@ def piper(
         fixed_cartesian_rpy_deg=fixed_cartesian_rpy_deg,
         max_cartesian_step_m=max_cartesian_step_m,
         home_joints=home_joints,
+    )
+
+
+@cfn.config(
+    ip_address='192.168.1.233',
+    use_robot_calibration=True,
+    speed=50.0,
+    acceleration=1100.0,
+    command_hz=100.0,
+    max_joint_step_rad=0.05,
+    home_joints=[0.0, -0.6, -0.6, 0.0, 1.2, 0.0],
+    has_gripper=True,
+    gripper_model='hand-e',
+    gripper_open_width=190,
+    gripper_closed_width=150,
+    gripper_force=255,
+    gripper_speed=100,
+)
+def xarm6(
+    ip_address: str,
+    use_robot_calibration: bool,
+    speed: float,
+    acceleration: float,
+    command_hz: float,
+    max_joint_step_rad: float,
+    home_joints: list[float],
+    has_gripper: bool,
+    gripper_model: str,
+    gripper_open_width: int,
+    gripper_closed_width: int,
+    gripper_force: int,
+    gripper_speed: int,
+):
+    from positronic.drivers.roboarm.xarm6.driver import Robot
+
+    return Robot(
+        ip_address=ip_address,
+        use_robot_calibration=use_robot_calibration,
+        speed=speed,
+        acceleration=acceleration,
+        command_hz=command_hz,
+        max_joint_step_rad=max_joint_step_rad,
+        home_joints=home_joints,
+        has_gripper=has_gripper,
+        gripper_model=gripper_model,
+        gripper_open_width=gripper_open_width,
+        gripper_closed_width=gripper_closed_width,
+        gripper_force=gripper_force,
+        gripper_speed=gripper_speed,
     )
